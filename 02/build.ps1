@@ -38,3 +38,16 @@ cmake .. -G "Visual Studio 17 2022"
 cmake --build .
 popd
 
+# Copy resampler files
+$ResamplerHdr = Join-Path $OpusToolsPath "src" "speex_resampler.h"
+$ResamplerCpp = Join-Path $OpusToolsPath "src" "resample.c"
+$ArchHdr = Join-Path $OpusToolsPath "src" "arch.h"
+Copy-Item $ResamplerHdr (Join-Path $ProjectPath "speex_resampler.h")
+Copy-Item $ResamplerCpp (Join-Path $ProjectPath "resample.c")
+Copy-Item $ArchHdr (Join-Path $ProjectPath "arch.h")
+
+# Build sample
+cl.exe /Iopus\include /EHsc /MDd /D "RANDOM_PREFIX=opustools" /D "OUTSIDE_SPEEX" /D "RESAMPLE_FULL_SINC_TABLE" play.cpp WAVFileReader.cpp resample.c /Fe: play.exe /link ole32.lib user32.lib /LIBPATH:opus\build\Debug
+
+# Run sample
+.\play.exe

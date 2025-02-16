@@ -1,6 +1,6 @@
 directx-sdk-samples
 opus
 opus-tools
-WAVFileReader.h
-WAVFileReader.cpp
+scratch*
+*.pdb
 
