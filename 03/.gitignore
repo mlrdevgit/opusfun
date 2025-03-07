@@ -1,0 +1,9 @@
+directx-sdk-samples
+opus
+opus-tools
+scratch*
+*.pdb
+arch.h
+resample.c
+speex_resampler.h
+
