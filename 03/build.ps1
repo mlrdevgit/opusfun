@@ -23,9 +23,21 @@ function CloneAsNeeded {
 $ProjectPath = $PSScriptRoot
 
 # Clone repos
+$HiredisPath = CloneAsNeeded "hiredis" "https://github.com/redis/hiredis"
 $SdkSamplePath = CloneAsNeeded "directx-sdk-samples" "https://github.com/walbourn/directx-sdk-samples"
 $OpusPath = CloneAsNeeded "opus" "https://github.com/xiph/opus"
 $OpusToolsPath = CloneAsNeeded "opus-tools" "https://github.com/xiph/opus-tools"
+
+# Build hiredis
+pushd .
+cd $HiredisPath
+if (-not (test-path build)) {
+  mkdir build
+}
+cd build
+cmake .. -G "Visual Studio 17 2022"
+cmake --build .
+popd
 
 # Build opus
 pushd .
@@ -34,7 +46,7 @@ if (-not (test-path build)) {
   mkdir build
 }
 cd build
-cmake .. -G "Visual Studio 17 2022"
+cmake .. -G "Visual Studio 17 2022" -DBUILD_SHARED_LIBS=OFF
 cmake --build .
 popd
 
@@ -47,7 +59,8 @@ Copy-Item $ResamplerCpp (Join-Path $ProjectPath "resample.c")
 Copy-Item $ArchHdr (Join-Path $ProjectPath "arch.h")
 
 # Build sample
-cl.exe /Iopus\include /EHsc /MDd /D "RANDOM_PREFIX=opustools" /D "OUTSIDE_SPEEX" /D "RESAMPLE_FULL_SINC_TABLE" play.cpp WAVFileReader.cpp resample.c /Fe: play.exe /link ole32.lib user32.lib /LIBPATH:opus\build\Debug
+cl.exe /Iopus\include /EHsc /MDd /D "RANDOM_PREFIX=opustools" /D "OUTSIDE_SPEEX" /D "RESAMPLE_FULL_SINC_TABLE" play.cpp WAVFileReader.cpp resample.c /Fe: play.exe /link ole32.lib user32.lib hiredisd.lib Ws2_32.lib /LIBPATH:opus\build\Debug /LIBPATH:hiredis\build\Debug
 
 # Run sample
 .\play.exe
+
