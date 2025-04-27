@@ -59,8 +59,13 @@ Copy-Item $ResamplerCpp (Join-Path $ProjectPath "resample.c")
 Copy-Item $ArchHdr (Join-Path $ProjectPath "arch.h")
 
 # Build sample
-cl.exe /Iopus\include /EHsc /MDd /D "RANDOM_PREFIX=opustools" /D "OUTSIDE_SPEEX" /D "RESAMPLE_FULL_SINC_TABLE" play.cpp WAVFileReader.cpp resample.c /Fe: play.exe /link ole32.lib user32.lib hiredisd.lib Ws2_32.lib /LIBPATH:opus\build\Debug /LIBPATH:hiredis\build\Debug
+cl.exe /Iopus\include /Ihiredis /EHsc /MDd /D "RANDOM_PREFIX=opustools" /D "OUTSIDE_SPEEX" /D "RESAMPLE_FULL_SINC_TABLE" play.cpp WAVFileReader.cpp resample.c /Fe: play.exe /link ole32.lib user32.lib hiredisd.lib Ws2_32.lib /LIBPATH:opus\build\Debug /LIBPATH:hiredis\build\Debug
+
+# Display instructions on how to run this
+Write-Host "Specify the REDIS_HOST and REDIS_PWD environment variables for redis connection."
+Write-Host "To start sending data, run .\play.exe --send"
+Write-Host "To start receiving data, run .\play.exe --receive"
 
 # Run sample
-.\play.exe
+# .\play.exe
 

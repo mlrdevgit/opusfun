@@ -1,24 +1,39 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <cassert>
 #include <cstdio>
 #include <memory>
+#include <thread>
 #include <vector>
 
+#include <audioclient.h>
+#include <mmdeviceapi.h>
 #include <xaudio2.h>
+#include <WinSock2.h>
 
 #include <wrl\client.h>
 
 #include <opus.h>
 #pragma comment(lib, "opus.lib")
 
+#include "hiredis.h"
+
 #include "speex_resampler.h"
 
 #include "WAVFileReader.h"
 
+#define REFTIMES_PER_SEC  10000000
+#define REFTIMES_PER_MILLISEC  10000
+
 const wchar_t PlayFileName[] = LR"(directx-sdk-samples\Media\Wavs\MusicMono.wav)";
 const char CompressedFileName[] = "scratch.opus";
 const wchar_t DecompressedFileName[] = L"scratch.opus.wav";
+
+const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
+const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
+const IID IID_IAudioClient = __uuidof(IAudioClient);
+const IID IID_IAudioCaptureClient = __uuidof(IAudioCaptureClient);
 
 namespace mwrl = Microsoft::WRL;
 
@@ -39,88 +54,125 @@ namespace mwrl = Microsoft::WRL;
   } } while (false)
 
 
+////////////////////////////////////////////////////////////////////////////
+// Shared declarations.
+
+struct SenderPacketHeader
+{
+  uint32_t dataLength;
+  uint32_t samplesPerSecond;
+  uint16_t frameIndex;
+  uint8_t channels;
+  uint8_t padding;
+};
+
+const char* g_rhost;
+const char* g_rpwd;
+const int g_rport = 6379;
+const char* g_broadcastTopic = "convo";
+
 bool IsFormatOrSubFormat(const WAVEFORMATEX* wfx, WORD format, const GUID& subFormat)
 {
-    return wfx->wFormatTag == format ||
-        (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-            IsEqualGUID(((const WAVEFORMATEXTENSIBLE*)wfx)->SubFormat, subFormat));
+  return wfx->wFormatTag == format ||
+    (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+      IsEqualGUID(((const WAVEFORMATEXTENSIBLE*)wfx)->SubFormat, subFormat));
 }
 
 HRESULT CheckFloatOrInt16(const WAVEFORMATEX* wfx, bool* isFloat)
 {
-    if (IsFormatOrSubFormat(wfx, WAVE_FORMAT_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))
+  if (IsFormatOrSubFormat(wfx, WAVE_FORMAT_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))
+  {
+    *isFloat = true;
+  }
+  else if (IsFormatOrSubFormat(wfx, WAVE_FORMAT_PCM, KSDATAFORMAT_SUBTYPE_PCM))
+  {
+    *isFloat = false;
+  }
+  else
+  {
+    return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+  }
+  return S_OK;
+}
+
+//! Create a connection to a redis host.
+static redisContext* connectToHost(const char* rhost, const char* rpwd) {
+    redisContext* rctx; // redis context object
+    redisReply* reply;  // redis reply object
+
+    printf("Connecting to redis server %s...\n", rhost);
+    rctx = redisConnect(rhost, g_rport);
+    if (!rctx || rctx->err) {
+        if (rctx) {
+            printf("Failed to connect: %s\n", rctx->errstr);
+        }
+        else {
+            printf("Failed to create redis context\n");
+        }
+        return 0;
+    }
+
+    printf("Authenticating with redis server...\n");
+    reply = (redisReply *)redisCommand(rctx, "AUTH %s", rpwd);
+    if (!reply || rctx->err) {
+        printf("Failed redis authorization\n");
+        freeReplyObject(reply); // ok to call if null
+        redisFree(rctx);
+        return 0;
+    }
+    freeReplyObject(reply);
+    printf("Connected to redis server\n");
+    return rctx;
+}
+
+static HRESULT CheckWaveFormat(WAVEFORMATEX* pwfx, bool *isFloat)
+{
+    HRESULT hr = S_OK;
+    // Should probably support WAVE_FORMAT_PCM as well.
+    if (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
     {
         *isFloat = true;
     }
-    else if (IsFormatOrSubFormat(wfx, WAVE_FORMAT_PCM, KSDATAFORMAT_SUBTYPE_PCM))
-    {
-        *isFloat = false;
-    }
     else
     {
-        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        WAVEFORMATEXTENSIBLE* extensible; // pointer into extensible area of audio format description
+        if (pwfx->wFormatTag != WAVE_FORMAT_EXTENSIBLE)
+        {
+            wprintf(L"Only supporting WAVE_FORMAT_IEEE_FLOAT(%u) or WAVE_FORMAT_EXTENSIBLE(%u) format\n", (unsigned)WAVE_FORMAT_PCM, (unsigned)WAVE_FORMAT_EXTENSIBLE);
+            IFC(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
+        }
+        extensible = (WAVEFORMATEXTENSIBLE*)pwfx;
+        if (extensible->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)
+        {
+            *isFloat = true;
+        }
+        else if (extensible->SubFormat == KSDATAFORMAT_SUBTYPE_PCM)
+        {
+            if (pwfx->wBitsPerSample != 16 || extensible->Samples.wValidBitsPerSample != 16)
+            {
+                wprintf(L"Only 16-bit int PCM samples are supported\n");
+                IFC(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
+            }
+            *isFloat = false;
+        }
+        else
+        {
+            wprintf(L"Only supporting KSDATAFORMAT_SUBTYPE_IEEE_FLOAT for WAVE_FORMAT_EXTENSIBLE(%u) format\n", (unsigned)WAVE_FORMAT_EXTENSIBLE);
+            IFC(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
+        }
     }
-    return S_OK;
-}
-
-HRESULT PlayWave(IXAudio2 * pXaudio2, LPCWSTR szFilename)
-{
-  HRESULT hr = S_OK;
-  BOOL isRunning = TRUE;
-  std::unique_ptr<uint8_t[]> waveFile;
-  DirectX::WAVData waveData;
-  XAUDIO2_BUFFER buffer = {};
-  IXAudio2SourceVoice* pSourceVoice = nullptr;
-
-  IFC(DirectX::LoadWAVAudioFromFileEx(szFilename, waveFile, waveData));
-  IFC(pXaudio2->CreateSourceVoice(&pSourceVoice, waveData.wfx));
-
-  // Submit the wave sample data using an XAUDIO2_BUFFER structure
-  buffer.pAudioData = waveData.startAudio;
-  buffer.Flags = XAUDIO2_END_OF_STREAM;  // tell the source voice not to expect any data after this buffer
-  buffer.AudioBytes = waveData.audioBytes;
-  IFC(pSourceVoice->SubmitSourceBuffer(&buffer));
-  IFC(pSourceVoice->Start(0));
-
-  // Let the sound play
-  while (SUCCEEDED(hr) && isRunning)
-  {
-    XAUDIO2_VOICE_STATE state;
-    pSourceVoice->GetState(&state);
-    isRunning = (state.BuffersQueued > 0) != 0;
-
-    // Wait till the escape key is pressed
-    if (GetAsyncKeyState(VK_ESCAPE))
-        break;
-
-    Sleep(10);
-  }
-
-  // Wait till the escape key is released
-  while (GetAsyncKeyState(VK_ESCAPE))
-    Sleep(10);
-
-  pSourceVoice->DestroyVoice();
 Cleanup:
-  return hr;
+    return hr;
 }
 
-HRESULT RunFilePlayback()
+static void PrintWaveFormat(WAVEFORMATEX* pwfx)
 {
-  HRESULT hr = S_OK;
-  mwrl::ComPtr<IXAudio2> xaudio;
-  IXAudio2MasteringVoice* masteringVoice;
-
-  IFC(XAudio2Create(xaudio.GetAddressOf(), 0, XAUDIO2_DEFAULT_PROCESSOR));
-  IFC(xaudio->CreateMasteringVoice(&masteringVoice));
-  IFC(PlayWave(xaudio.Get(), PlayFileName));
-
-  masteringVoice->DestroyVoice();
-  xaudio.Reset();
-
-Cleanup:
-  return hr;
+    wprintf(L"Data format tag=%u channels=%u samples-per-sec=%u avg-bytes-per-sec=%u block-align=%u bits-per-mono-sample=%u extra-size=%u\n",
+        (unsigned)pwfx->wFormatTag, (unsigned)pwfx->nChannels, (unsigned)pwfx->nSamplesPerSec,
+        (unsigned)pwfx->nAvgBytesPerSec, (unsigned)pwfx->nBlockAlign, (unsigned)pwfx->wBitsPerSample,
+        (unsigned)pwfx->cbSize);
 }
+
 
 HRESULT ResampleWaveData(int channels, int inRate, int outRate, bool isFloat, const void *in, int inCount, unsigned int *inProcessed, void *out, int outSize, unsigned int *outCount)
 {
@@ -159,226 +211,471 @@ Cleanup:
 
 HRESULT WriteToFile(const void* ptr, size_t len, FILE* fp)
 {
-    size_t written = fwrite(ptr, 1, len, fp);
-    if (written != len)
-    {
-        return HRESULT_FROM_ERRNO(errno);
-    }
-    return S_OK;
+  size_t written = fwrite(ptr, 1, len, fp);
+  if (written != len)
+  {
+    return HRESULT_FROM_ERRNO(errno);
+  }
+  return S_OK;
 }
 
 template <typename T>
 HRESULT WriteValueToFile(const T& value, FILE* fp)
 {
-    return WriteToFile(&value, sizeof(T), fp);
-}
-
-HRESULT ReadFromFile(void *ptr, size_t len, FILE* fp)
-{
-    size_t read = fread(ptr, 1, len, fp);
-    if (read != len)
-    {
-        return HRESULT_FROM_ERRNO(errno);
-    }
-    return S_OK;
-}
-
-template <typename T>
-HRESULT ReadValueFromFile(T& value, FILE* fp)
-{
-    return ReadFromFile(&value, sizeof(T), fp);
+  return WriteToFile(&value, sizeof(T), fp);
 }
 
 template <typename T, typename TOther>
 void AppendBufferByMemcpy(std::vector<T>& value, const TOther* ptr, size_t elementCount)
 {
-    static_assert(sizeof(TOther) % sizeof(T) == 0);
-    size_t s = value.size();
-    size_t destSize = elementCount * sizeof(TOther) / sizeof(T);
-    value.resize(value.size() + destSize);
-    memcpy(value.data() + s, ptr, elementCount * sizeof(TOther));
+  static_assert(sizeof(TOther) % sizeof(T) == 0);
+  size_t s = value.size();
+  size_t destSize = elementCount * sizeof(TOther) / sizeof(T);
+  value.resize(value.size() + destSize);
+  memcpy(value.data() + s, ptr, elementCount * sizeof(TOther));
 }
 
-HRESULT RunFileCompress()
+////////////////////////////////////////////////////////////////////////////
+// Sender.
+
+//! Use this class to manage audio frame data from the microphone.
+class MicrophoneAudioFrameDataController
 {
-    HRESULT hr = S_OK;
-    BOOL isRunning = TRUE;
-    std::unique_ptr<uint8_t[]> waveFile;
-    DirectX::WAVData waveData;
-    XAUDIO2_BUFFER buffer = {};
-    IXAudio2SourceVoice* pSourceVoice = nullptr;
-    unsigned char encodedData[1024 * 4];
-    size_t encodedDataLength = 0;
-    // Could be OPUS_APPLICATION_VOIP instead
-    const int application = OPUS_APPLICATION_AUDIO;
-    int error;
-    OpusEncoder* enc = nullptr;
-    const opus_int16* audioSamples = nullptr;
-    const opus_int16* audioSamplesEnd = nullptr;
-    int maxFrameSizeInSamples = 0;
-    bool isFloat;
-    bool isOpusSampleRate;
-    void* resampledData = nullptr;
-    size_t audioSampleCount = 0; // count of audio samples in buffer
-    size_t audioSampleSize; // size of a single audio sample, in bytes
-    const int resampleTargetRate = 24000;
-    int audioSamplesPerSec;
-    FILE* encodedFile = nullptr;
+public:
+  void Setup(size_t frameDataForTenMsInBytes)
+  {
+    m_frameDataForTenMsInBytes = frameDataForTenMsInBytes;
+  }
 
-    // Write out the encoded data to a file.
-    encodedFile = fopen(CompressedFileName, "wb");
-    if (encodedFile == nullptr)
+  void HandleAudioData(const uint8_t* pData, size_t dataSizeInBytes)
+  {
+    assert(m_pData == nullptr);
+    assert(m_numBytesAvailableInData == 0);
+    m_pData = pData;
+    m_numBytesAvailableInData = dataSizeInBytes;
+  }
+
+  bool AcquireFrameData(const uint8_t** pOutData, uint32_t* outDataSize)
+  {
+    *pOutData = nullptr;
+    *outDataSize = 0;
+    // If we have enough data in the managed buffer, return it.
+    if (m_frameDataSize >= m_frameDataForTenMsInBytes)
     {
-        IFC(HRESULT_FROM_ERRNO(errno));
+      *pOutData = m_frameData.data();
+      *outDataSize = m_frameDataForTenMsInBytes;
+      return true;
     }
 
-    IFC(DirectX::LoadWAVAudioFromFileEx(PlayFileName, waveFile, waveData));
-    IFC(CheckFloatOrInt16(waveData.wfx, &isFloat));
-    audioSamplesPerSec = waveData.wfx->nSamplesPerSec;
-    audioSampleSize = isFloat ? sizeof(float) : sizeof(uint16_t);
-    maxFrameSizeInSamples = audioSamplesPerSec / 100; // (10 ms intervals)
-    audioSamples = (opus_int16 *)waveFile.get();
-    audioSamplesEnd = audioSamples + waveData.audioBytes / 2;
-    audioSampleCount = waveData.audioBytes / audioSampleSize;
-
-    // should resample if not one of 8000, 12000, 16000, 24000, or 48000
-    isOpusSampleRate =
-        audioSamplesPerSec == 8000 ||
-        audioSamplesPerSec == 12000 ||
-        audioSamplesPerSec == 16000 ||
-        audioSamplesPerSec == 24000 ||
-        audioSamplesPerSec == 48000;
-    if (!isOpusSampleRate)
+    // If we have a bit left over, see if we can move some data into it and return a continguous buffer.
+    if (m_frameDataSize > 0)
     {
-        const int* inData = (const int *)audioSamples;
-        float audioDurationSeconds = (float)audioSampleCount / audioSamplesPerSec;
-        int inCount = audioSampleCount;
-        unsigned int inProcessed = 0;
-        int outSize = audioDurationSeconds * resampleTargetRate;
-        unsigned int outCount = 0;
-        resampledData = malloc(outSize * audioSampleSize);
-        IFC(ResampleWaveData(waveData.wfx->nChannels, audioSamplesPerSec, 24000, isFloat, inData, inCount, &inProcessed, resampledData, outSize, &outCount));
-        audioSamplesPerSec = resampleTargetRate;
-        audioSamples = (const opus_int16*)resampledData;
-        audioSamplesEnd = audioSamples + outCount * (audioSampleSize / sizeof(opus_int16));
-        maxFrameSizeInSamples = audioSamplesPerSec / 100; // (10 ms intervals)
-        audioSampleCount = outCount;
+      if (m_frameDataSize + m_numBytesAvailableInData >= m_frameDataForTenMsInBytes)
+      {
+        AppendDataIntoManagedBuffer(m_frameDataForTenMsInBytes - m_frameDataSize);
+        *pOutData = m_frameData.data();
+        *outDataSize = m_frameDataForTenMsInBytes;
+        return true;
+      }
+      else
+      {
+        return false;
+      }
     }
 
-    IFC(WriteValueToFile(audioSamplesPerSec, encodedFile));
-
-    enc = opus_encoder_create(audioSamplesPerSec, waveData.wfx->nChannels, application, &error);
-    IFC_OPUS(error);
-
-    // Now, process all audio samples in 10ms increments, and simply add them to a large buffer.
-    while (audioSamples < audioSamplesEnd)
+    // If the managed buffer is empty, see if we can return some data from the audio buffer.
+    assert(m_frameDataSize == 0);
+    if (m_frameDataForTenMsInBytes <= m_numBytesAvailableInData)
     {
-        // likely wrong, need channels
-        int frameSize = std::min(maxFrameSizeInSamples, (int)(audioSamplesEnd - audioSamples));
-        opus_int32 max_data_bytes = sizeof(encodedData);
-        opus_int32 lenOrErr = isFloat ?
-            opus_encode_float(enc, (const float *)audioSamples, frameSize, encodedData, max_data_bytes) : 
-            opus_encode(enc, audioSamples, frameSize, encodedData, max_data_bytes);
-        if (lenOrErr < 0 && frameSize < maxFrameSizeInSamples)
-        {
-            // The last frame might not be an acceptable frame size, drop the last few milliseconds.
-            break;
-        }
-        IFC_OPUS(lenOrErr);
-        IFC(WriteValueToFile(lenOrErr, encodedFile));
-        IFC(WriteToFile(encodedData, lenOrErr, encodedFile));
-        audioSamples += frameSize;
-        encodedDataLength += lenOrErr;
+      *pOutData = m_pData;
+      *outDataSize = m_frameDataForTenMsInBytes;
+      return true;
     }
 
-Cleanup:
-    if (encodedFile)
+    return false;
+  }
+
+  void ReleaseFrameData(const uint8_t *ptr, uint32_t dataSize)
+  {
+    if (ptr == m_frameData.data())
     {
-        fclose(encodedFile);
+      if (dataSize == m_frameDataSize)
+      {
+        m_frameDataSize = 0;
+      }
+      else
+      {
+        m_frameDataSize -= dataSize;
+        memcpy(m_frameData.data(), m_frameData.data() + dataSize, m_frameDataSize);
+      }
     }
-    free(resampledData);
-    opus_encoder_destroy(enc);
-    return hr;
-}
-
-HRESULT RunFileDecompress()
-{
-    HRESULT hr = S_OK;
-    OpusDecoder* dec = nullptr;
-    const int sampleRate = 24000;
-    const int channels = 1;
-    int error;
-    FILE* encodedFile = nullptr;
-    long encodedFileLength;
-    long encodedFileRead;
-    int audioSamplesPerSec;
-    std::unique_ptr<uint8_t[]> encodedBuffer;
-    std::vector<uint8_t> outData;
-    encodedFile = fopen(CompressedFileName, "rb");
-    if (!encodedFile)
+    else
     {
-        IFC(HRESULT_FROM_ERRNO(errno));
+      assert(ptr == m_pData);
+      assert(dataSize <= m_numBytesAvailableInData);
+      m_pData += dataSize;
+      m_numBytesAvailableInData -= dataSize;
     }
-    ReadValueFromFile(audioSamplesPerSec, encodedFile);
+  }
 
-    dec = opus_decoder_create(sampleRate, channels, &error);
-    IFC_OPUS(error);
-
-    for (;;)
+  void PrepareToRelease()
+  {
+    // Move the remainder of available data into managed buffer.
+    if (m_numBytesAvailableInData > 0)
     {
-        uint8_t encodedBuffer[1024 * 8];
-        opus_int16 pcmBuffer[1024 * 8];
-        opus_int32 packetLen;
-        if (FAILED(ReadValueFromFile(packetLen, encodedFile)))
-        {
-            hr = S_OK;
-            break;
-        }
-        IFC(ReadFromFile(encodedBuffer, packetLen, encodedFile));
-
-        // Lost packets can be replaced with loss concealment by calling
-        // the decoder with a null pointer and zero length for the missing packet.
-        int sampleCount = opus_decode(dec, encodedBuffer, packetLen, pcmBuffer, sizeof(pcmBuffer) / sizeof(pcmBuffer[0]), 0);
-        IFC_OPUS(sampleCount);
-        AppendBufferByMemcpy(outData, pcmBuffer, sampleCount);
+      AppendDataIntoManagedBuffer(m_numBytesAvailableInData);
+      assert(m_numBytesAvailableInData == 0);
     }
+    m_pData = nullptr;
+  }
 
+private:
+  void AppendDataIntoManagedBuffer(uint32_t dataInBytes)
+  {
+    assert(dataInBytes <= m_numBytesAvailableInData);
+    if (m_frameDataSize + dataInBytes > m_frameData.size())
     {
-        WAVEFORMATEX localFormat;
-        localFormat.wFormatTag = WAVE_FORMAT_PCM;
-        localFormat.nChannels = 1;
-        localFormat.nSamplesPerSec = audioSamplesPerSec;
-        localFormat.nAvgBytesPerSec = localFormat.nSamplesPerSec * 2;
-        localFormat.nBlockAlign = 2;
-        localFormat.wBitsPerSample = 16;
-        localFormat.cbSize = 0;
-
-        DirectX::WAVData wavData = {};
-        wavData.audioBytes = outData.size();
-        wavData.wfx = &localFormat;
-        wavData.startAudio = outData.data();
-        DirectX::WriteWAVDataToFile(DecompressedFileName, wavData);
+      m_frameData.resize(m_frameDataSize + dataInBytes);
     }
+    uint8_t* end = m_frameData.data() + m_frameDataSize;
+    memcpy(end, m_pData, dataInBytes);
+    m_frameDataSize += dataInBytes;
+    m_numBytesAvailableInData -= dataInBytes;
+    m_pData += dataInBytes;
+  }
 
-Cleanup:
-    if (encodedFile)
-    {
-        fclose(encodedFile);
-    }
-    opus_decoder_destroy(dec);
-    return hr;
-}
+  const uint8_t* m_pData{ nullptr };
+  size_t m_numBytesAvailableInData{ 0 };
+  size_t m_frameDataForTenMsInBytes{ 0 };
+  size_t m_frameDataSize{ 0 };
+  std::vector<uint8_t> m_frameData;
+};
 
-int main()
+HRESULT RunSender()
 {
   HRESULT hr = S_OK;
 
-  IFC(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-  IFC(RunFileCompress());
-  IFC(RunFileDecompress());
-  IFC(RunFilePlayback());
-  CoUninitialize();
+  // Time control.
+  ULONGLONG senderTimeMs = GetTickCount64();
+  ULONGLONG exitTimeMs = senderTimeMs + 10 * 1000;
+
+  // Audio client (microphone) and buffers.
+  REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_MILLISEC * 10; // initial desired duration
+  REFERENCE_TIME hnsActualDuration; // actual duration in allocated buffer
+  UINT32 bufferFrameCount; // maximum number of frames in audio client buffer
+  UINT32 numFramesAvailable; // available number of frames in audio client buffer
+  IMMDeviceEnumerator* pEnumerator = NULL; // used to find microphone
+  IMMDevice* pDevice = NULL; // used to find microphone
+  IAudioClient* pAudioClient = NULL; // used to create and initialize an audio stream between e app and the audio engine
+  IAudioCaptureClient* pCaptureClient = NULL; // used to read input data from a capture endpoint buffer
+  WAVEFORMATEX* pwfx = NULL; // audio format for audio client
+  WAVEFORMATEXTENSIBLE* extensible = NULL; // pointer into extensible area of audio format description
+  UINT32 packetLength = 0; // number of frames in the next data packet in the capture endpoint buffer
+  BOOL bDone = FALSE;
+  BYTE* pData; // pointer into the capture client buffer for the next data packet to be read
+  DWORD flags; // flags about bufffer
+  MicrophoneAudioFrameDataController audioFrameData; // controller for audio frame data
+
+  // Resampler and buffers.
+  const int quality = SPEEX_RESAMPLER_QUALITY_DEFAULT;
+  int err = 0;
+  SpeexResamplerState* resampler = nullptr;
+  const int application = OPUS_APPLICATION_VOIP;
+  int error;
+  int maxFrameSizeInSamples = 0;
+  bool isFloat;
+  bool isOpusSampleRate;
+  void* resampledData = nullptr;
+  size_t audioSampleCount = 0; // count of audio samples in buffer
+  size_t audioSampleSize; // size of a single audio sample, in bytes
+  const int resampleTargetRate = 24000;
+  int audioSamplesPerSec;
+  unsigned numFramesIn10Ms;
+
+  // Encoder and buffers.
+  OpusEncoder* enc = nullptr;
+  std::vector<uint8_t> packetBuffer;
+  SenderPacketHeader* packetHeader = nullptr;
+  unsigned char* encodedData = nullptr;
+  size_t encodedDataCapacity = 0;
+
+  // Connection.
+  redisContext* senderContext = nullptr;
+  redisReply* senderReply = nullptr;
+
+  // Setup microphone, resampler, encoder, connection.
+  IFC(CoCreateInstance(
+      CLSID_MMDeviceEnumerator, NULL,
+      CLSCTX_ALL, IID_IMMDeviceEnumerator,
+      (void**)&pEnumerator));
+  IFC(pEnumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &pDevice));
+  IFC(pDevice->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&pAudioClient));
+  IFC(pAudioClient->GetMixFormat(&pwfx));
+  IFC(pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hnsRequestedDuration, 0, pwfx, NULL));
+  IFC(pAudioClient->GetBufferSize(&bufferFrameCount));
+  IFC(pAudioClient->GetService(IID_IAudioCaptureClient, (void**)&pCaptureClient));
+  PrintWaveFormat(pwfx);
+  IFC(CheckWaveFormat(pwfx, &isFloat));
+  // Calculate the actual duration of the allocated buffer.
+  hnsActualDuration = (double)REFTIMES_PER_SEC * bufferFrameCount / pwfx->nSamplesPerSec;
+  printf("Actual buffer duration in ms: %u bufferFrameCount=%u\n", (unsigned)(hnsActualDuration / REFTIMES_PER_MILLISEC), bufferFrameCount);
+  audioSamplesPerSec = pwfx->nSamplesPerSec;
+
+  // Example values:
+  // pwfx->wFormatTag = WAVE_FORMAT_EXTENSIBLE
+  // pwfx->nChannels = 2
+  // pwfx->nSamplesPerSec = 48000
+  // pwfx->nAvgBytesPerSec = 384000 (ie, 48000 * 8 or nSamplesPerSec * nBlockAlign for PCM)
+  // pwfx->wBitsPerSample = 32 (ie, 4 bytes per sample)
+  // extensible->Samples.wValidBitsPerSample = 32 (ie, all bits have information, this isn't a 20-bits-in-32 case)
+  // extensible->dwChannelMask = 3 (front left and right speakers)
+  // extensible->SubFormat = WAVE_FORMAT_IEEE_FLOAT
+
+  // Setup resampler.
+  isOpusSampleRate =
+    audioSamplesPerSec == 8000 ||
+    audioSamplesPerSec == 12000 ||
+    audioSamplesPerSec == 16000 ||
+    audioSamplesPerSec == 24000 ||
+    audioSamplesPerSec == 48000;
+
+  if (pwfx->nChannels > 2)
+  {
+    // Supporting only mono or stereo.
+    IFC(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
+  }
+  audioSamplesPerSec = pwfx->nSamplesPerSec;
+  audioSampleSize = isFloat ? sizeof(float) : sizeof(uint16_t);
+  maxFrameSizeInSamples = audioSamplesPerSec / 100; // (10 ms intervals)
+  if (!isOpusSampleRate)
+  {
+    resampler = speex_resampler_init(pwfx->nChannels, audioSamplesPerSec, resampleTargetRate, quality, &err);
+    IFC_RESAMPLER(err);
+  }
+
+  // Setup encoder.
+  enc = opus_encoder_create(audioSamplesPerSec, pwfx->nChannels, application, &error);
+  IFC_OPUS(error);
+  numFramesIn10Ms = (audioSamplesPerSec / 100) * pwfx->nChannels;
+  encodedDataCapacity = (audioSamplesPerSec / 100) * 4 * pwfx->nChannels; // 4 bytes per sample for each 10ms, per channel
+  packetBuffer.resize(sizeof(SenderPacketHeader) + encodedDataCapacity);
+  packetHeader = reinterpret_cast<SenderPacketHeader*>(packetBuffer.data());
+  encodedData = reinterpret_cast<unsigned char*>(packetHeader + 1);
+  packetHeader->channels = pwfx->nChannels;
+  packetHeader->frameIndex = 0;
+  packetHeader->padding = 0;
+  packetHeader->samplesPerSecond = audioSamplesPerSec;
+  audioFrameData.Setup(pwfx->nAvgBytesPerSec / 100);
+
+  // Setup connection.
+  senderContext = connectToHost(g_rhost, g_rpwd);
+  if (!senderContext) {
+    printf("Failed to create sender context\n");
+    return 1;
+  }
+
+  // Loop: read microphone, resample, encode, transmit.
+  IFC(pAudioClient->Start());
+  for (;;)
+  {
+    if (GetTickCount64() >= exitTimeMs)
+    {
+      break;
+    }
+
+    // Sleep for half the buffer duration.
+    Sleep(hnsActualDuration / REFTIMES_PER_MILLISEC / 2);
+
+    for (;;)
+    {
+      if (GetTickCount64() >= exitTimeMs)
+      {
+        break;
+      }
+
+      // Packets may be smaller than 10ms, in which case we should copy the data to
+      // concatenate with data in future packets.
+      // TODO: copy and append into buffer, extract (or try and be clever and minimize copies)
+      //
+      // Get the available data in the shared buffer.
+      IFC(pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL));
+      if (hr == AUDCLNT_S_BUFFER_EMPTY)
+      {
+        break;
+      }
+      audioFrameData.HandleAudioData(pData, numFramesAvailable * pwfx->nBlockAlign * pwfx->nChannels);
+      opus_int32 lenOrErr;
+      if (!isOpusSampleRate)
+      {
+        // TODO: resample and encode
+      }
+      else
+      {
+        const uint8_t* encodingFrameData;
+        uint32_t encodingFrameDataSizeInBytes;
+        while (audioFrameData.AcquireFrameData(&encodingFrameData, &encodingFrameDataSizeInBytes))
+        {
+          unsigned encodingFrameDataSizeInFrames = encodingFrameDataSizeInBytes / (pwfx->nBlockAlign * pwfx->nChannels);
+          lenOrErr = isFloat ?
+          opus_encode_float(enc, (const float*)encodingFrameData, encodingFrameDataSizeInFrames, encodedData, encodedDataCapacity) :
+          opus_encode(enc, (const int16_t*)encodingFrameData, encodingFrameDataSizeInFrames, encodedData, encodedDataCapacity);
+          if (lenOrErr < 0)
+          {
+            // The last frame might not be an acceptable frame size, drop the last few milliseconds.
+            printf("Failed with numFramesAvailable=%u numFramesIn10Ms=%u\n", (unsigned)encodingFrameDataSizeInFrames, numFramesIn10Ms);
+            break;
+          }
+          audioFrameData.ReleaseFrameData(encodingFrameData, encodingFrameDataSizeInBytes);
+
+          // Now, packetize and send it out.
+          packetHeader->frameIndex++;
+          packetHeader->dataLength = lenOrErr;
+          size_t packetLength = sizeof(*packetHeader) + lenOrErr;
+          void* senderReply = redisCommand(senderContext,
+            "PUBLISH %s %b", g_broadcastTopic, packetHeader, packetLength);
+          freeReplyObject(senderReply);
+          printf("Sent packet %u len %u\n", packetHeader->frameIndex, (unsigned)packetLength);
+        }
+      }
+
+      audioFrameData.PrepareToRelease();
+      IFC(pCaptureClient->ReleaseBuffer(numFramesAvailable));
+    }
+  }
 
 Cleanup:
+  // Cleanup microphone, resampler, encoder, connection.
+  if (pAudioClient)
+  {
+    pAudioClient->Stop();
+    pAudioClient->Release();
+  }
+  CoTaskMemFree(pwfx);
+  if (pEnumerator) pEnumerator->Release();
+  if (pDevice) pDevice->Release();
+  if (pCaptureClient) pCaptureClient->Release();
+  if (resampler)
+  {
+    speex_resampler_destroy(resampler);
+  }
+  opus_encoder_destroy(enc);
+  redisFree(senderContext);
+  return hr;
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Receiver.
+
+static redisContext* g_receiverContext;
+
+void RunReceiverNetwork()
+{
+  FILE *fp = nullptr;
+  redisContext *rc = connectToHost(g_rhost, g_rpwd);
+  redisReply* reply;
+  g_receiverContext = rc;
+  fp = fopen("scratch_received.bin", "wb");
+  reply = (redisReply *)redisCommand(rc, "SUBSCRIBE %s", g_broadcastTopic);
+  if (reply)
+  {
+    freeReplyObject(reply);
+    reply = NULL;
+  }
+
+  //struct timeval tv = { 0, 1000 };
+  //redisSetTimeout(rc, tv);
+  for (;;) {
+    if (redisGetReply(rc, (void**)&reply) != REDIS_OK)
+    {
+      printf("Failed to read reply\n");
+      break;
+    }
+    if (reply->type == REDIS_REPLY_ARRAY && reply->elements == 3)
+    {
+      printf("Broadcast listener message: %d\n",
+        (int)reply->element[2]->len);
+      IFC(WriteToFile(reply->element[2]->str, reply->element[2]->len, fp));
+    }
+    else
+    {
+      printf("did not understand reply\n");
+    }
+    freeReplyObject(reply);
+    reply = NULL;
+  }
+Cleanup:
+  if (fp)
+  {
+    fclose(fp);
+  }
+  g_receiverContext = nullptr;
+  redisFree(rc);
+}
+
+HRESULT RunReceiver()
+{
+  std::thread receiverNetwork(RunReceiverNetwork);
+  Sleep(30 * 1000);
+  printf("Shutting down receiver...");
+  closesocket(g_receiverContext->fd);
+  receiverNetwork.join();
+Cleanup:
+  return S_OK;
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Main function, decide to act as sender or receiver.
+
+int main(int argc, char* argv[])
+{
+  HRESULT hr = S_OK;
+  bool isSender = false;
+  bool isReceiver = false;
+
+  IFC(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+
+  g_rhost = getenv("REDIS_HOST");
+  g_rpwd = getenv("REDIS_PWD");
+  if (g_rhost == nullptr || g_rpwd == nullptr)
+  {
+    printf("Specify the REDIS_HOST and REDIS_PWD env variables\n");
+    IFC(E_FAIL);
+  }
+
+  for (int i = 0; i < argc; i++)
+  {
+    if (strcmp("--send", argv[i]) == 0)
+    {
+      isSender = true;
+      isReceiver = false;
+    }
+    else if (strcmp("--receive", argv[i]) == 0)
+    {
+      isReceiver = true;
+      isSender = false;
+    }
+  }
+
+  if (isSender == isReceiver)
+  {
+    printf("Use --send or --receive to specify one role\n");
+    IFC(E_FAIL);
+  }
+
+  if (isSender)
+  {
+    IFC(RunSender());
+  }
+  else if (isReceiver)
+  {
+    IFC(RunReceiver());
+  }
+  
+Cleanup:
+  CoUninitialize();
+  if (FAILED(hr))
+  {
+    printf("Failed with error 0x%08x\n", hr);
+  }
   return FAILED(hr) ? 1 : 0;
 }
