@@ -652,8 +652,8 @@ int main(int argc, char *argv[]) {
 
   g_rhost = getenv("REDIS_HOST");
   g_rpwd = getenv("REDIS_PWD");
-  g_rhost = "127.0.0.1";
-  g_rpwd = "pwd";
+  // g_rhost = "127.0.0.1"; // override if you're too lazy to set an env variable
+  // g_rpwd = "pwd";
   isSender = true;
   if (g_rhost == nullptr || g_rpwd == nullptr) {
     printf("Specify the REDIS_HOST and REDIS_PWD env variables\n");

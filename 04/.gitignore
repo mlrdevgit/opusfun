@@ -1,10 +1,6 @@
 .vs/
 build/
 out/
-directx-sdk-samples
-hiredis
-opus
-opus-tools
 scratch*
 *.pdb
 arch.h
