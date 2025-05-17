@@ -1,0 +1,12 @@
+[submodule "04/hiredis"]
+	path = 04/hiredis
+	url = ../../redis/hiredis.git
+[submodule "04/directx-sdk-samples"]
+	path = 04/directx-sdk-samples
+	url = ../../walbourn/directx-sdk-samples.git
+[submodule "04/opus"]
+	path = 04/opus
+	url = ../../xiph/opus.git
+[submodule "04/opus-tools"]
+	path = 04/opus-tools
+	url = ../../xiph/opus-tools.git
